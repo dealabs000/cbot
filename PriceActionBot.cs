@@ -1,39 +1,34 @@
 using System;
+using System.Collections.Generic;
 using cAlgo.API;
-using cAlgo.API.Indicators;
 
 namespace cAlgo.Robots
 {
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class XauScalpBot : Robot
+    public class XauSpikeScalpBot : Robot
     {
-        [Parameter("Fast MA Period", DefaultValue = 3)]
-        public int FastPeriod { get; set; }
+        [Parameter("Spike Lookback (bars)", DefaultValue = 20)]
+        public int SpikeLookback { get; set; }
 
-        [Parameter("Slow MA Period", DefaultValue = 8)]
-        public int SlowPeriod { get; set; }
+        [Parameter("Spike Multiplier", DefaultValue = 1.8)]
+        public double SpikeMultiplier { get; set; }
 
-        [Parameter("Zone Lookback", DefaultValue = 15)]
-        public int ZoneLookback { get; set; }
-
-        [Parameter("Wick Rejection Ratio", DefaultValue = 0.5)]
-        public double WickRejectionRatio { get; set; }
+        [Parameter("Min Body Ratio", DefaultValue = 0.6)]
+        public double MinBodyRatio { get; set; }
 
         [Parameter("Lots Per Entry", DefaultValue = 0.02)]
         public double LotsPerEntry { get; set; }
 
-        [Parameter("Number Of Entries", DefaultValue = 3)]
+        [Parameter("Number Of Entries", DefaultValue = 10)]
         public int NumEntries { get; set; }
 
-        [Parameter("Take Profit Per Trade ($)", DefaultValue = 2.0)]
+        [Parameter("Take Profit Per Trade ($)", DefaultValue = 1.0)]
         public double TakeProfitPerTrade { get; set; }
 
-        [Parameter("Stop Loss Per Trade ($)", DefaultValue = 5.0)]
+        [Parameter("Stop Loss Per Trade ($)", DefaultValue = 8.0)]
         public double StopLossPerTrade { get; set; }
 
-        private MovingAverage fastMa;
-        private MovingAverage slowMa;
-        private const string Label = "XauScalpBot";
+        private const string Label = "XauSpikeScalpBot";
 
         protected override void OnStart()
         {
@@ -43,47 +38,67 @@ namespace cAlgo.Robots
                 Stop();
                 return;
             }
-
-            fastMa = Indicators.MovingAverage(Bars.ClosePrices, FastPeriod, MovingAverageType.Simple);
-            slowMa = Indicators.MovingAverage(Bars.ClosePrices, SlowPeriod, MovingAverageType.Simple);
         }
 
         protected override void OnTick()
         {
+            // Manage exits every tick so $1 TP / $8 SL trigger instantly, per position
             CheckIndividualExits();
+
+            // As soon as we're flat, immediately look for the next spike (don't wait for next bar close)
+            if (!HasOpenPositions())
+            {
+                CheckForSpikeEntry();
+            }
         }
 
         protected override void OnBar()
         {
-            if (HasOpenPositions()) return;
-            if (Bars.ClosePrices.Count < SlowPeriod + 2) return;
-
-            int idx = Bars.ClosePrices.Count - 1;
-
-            double fastNow = fastMa.Result[idx];
-            double slowNow = slowMa.Result[idx];
-            double fastPrev = fastMa.Result[idx - 1];
-            double slowPrev = slowMa.Result[idx - 1];
-
-            string direction = null;
-            if (fastPrev <= slowPrev && fastNow > slowNow) direction = "up";
-            else if (fastPrev >= slowPrev && fastNow < slowNow) direction = "down";
-
-            if (direction == null) return;
-
-            double zoneHigh, zoneLow;
-            GetZone(idx, out zoneHigh, out zoneLow);
-
-            if (IsFakeout(idx - 1, zoneHigh, zoneLow, direction))
+            // Also check on each new bar close in case OnTick missed a fresh signal
+            if (!HasOpenPositions())
             {
-                Print("Fakeout detected on M1 — skipping entry.");
-                return;
+                CheckForSpikeEntry();
             }
-
-            OpenTradeGroup(direction);
         }
 
-        private void OpenTradeGroup(string direction)
+        private void CheckForSpikeEntry()
+        {
+            if (Bars.ClosePrices.Count < SpikeLookback + 2) return;
+
+            int idx = Bars.ClosePrices.Count - 2; // last FULLY closed bar
+            if (idx < SpikeLookback) return;
+
+            double avgRange = 0;
+            for (int i = idx - SpikeLookback; i < idx; i++)
+            {
+                avgRange += (Bars.HighPrices[i] - Bars.LowPrices[i]);
+            }
+            avgRange /= SpikeLookback;
+
+            double open = Bars.OpenPrices[idx];
+            double close = Bars.ClosePrices[idx];
+            double high = Bars.HighPrices[idx];
+            double low = Bars.LowPrices[idx];
+            double range = high - low;
+
+            if (range <= 0 || avgRange <= 0) return;
+
+            bool isSpike = range >= avgRange * SpikeMultiplier;
+            if (!isSpike) return;
+
+            double body = Math.Abs(close - open);
+            double bodyRatio = body / range;
+            if (bodyRatio < MinBodyRatio) return; // too wicky, not a clean directional spike
+
+            string direction = close > open ? "up" : "down";
+
+            Print("Spike detected: range={0:F2} avgRange={1:F2} bodyRatio={2:F2} dir={3}",
+                range, avgRange, bodyRatio, direction);
+
+            OpenTradeBatch(direction);
+        }
+
+        private void OpenTradeBatch(string direction)
         {
             var tradeType = direction == "up" ? TradeType.Buy : TradeType.Sell;
             var volumeInUnits = Symbol.QuantityToVolumeInUnits(LotsPerEntry);
@@ -93,7 +108,7 @@ namespace cAlgo.Robots
                 ExecuteMarketOrder(tradeType, SymbolName, volumeInUnits, Label);
             }
 
-            Print("Opened {0} independent entries, direction={1}", NumEntries, direction);
+            Print("Opened {0} spike-follow entries, direction={1}", NumEntries, direction);
         }
 
         private bool HasOpenPositions()
@@ -107,8 +122,7 @@ namespace cAlgo.Robots
 
         private void CheckIndividualExits()
         {
-            // Snapshot first since ClosePosition modifies the collection while iterating
-            var toClose = new System.Collections.Generic.List<Position>();
+            var toClose = new List<Position>();
 
             foreach (var position in Positions)
             {
@@ -125,47 +139,6 @@ namespace cAlgo.Robots
                 double pnl = position.NetProfit;
                 ClosePosition(position);
                 Print("Closed position {0}. P/L: {1:F2}", position.Id, pnl);
-            }
-        }
-
-        private void GetZone(int idx, out double zoneHigh, out double zoneLow)
-        {
-            int start = Math.Max(0, idx - ZoneLookback);
-            zoneHigh = double.MinValue;
-            zoneLow = double.MaxValue;
-
-            for (int i = start; i <= idx; i++)
-            {
-                if (Bars.HighPrices[i] > zoneHigh) zoneHigh = Bars.HighPrices[i];
-                if (Bars.LowPrices[i] < zoneLow) zoneLow = Bars.LowPrices[i];
-            }
-        }
-
-        private bool IsFakeout(int idx, double zoneHigh, double zoneLow, string direction)
-        {
-            if (idx < 0) return false;
-
-            double open = Bars.OpenPrices[idx];
-            double close = Bars.ClosePrices[idx];
-            double high = Bars.HighPrices[idx];
-            double low = Bars.LowPrices[idx];
-            double range = high - low;
-
-            if (range <= 0) return false;
-
-            if (direction == "up")
-            {
-                double upperWick = high - Math.Max(open, close);
-                bool brokeAbove = high > zoneHigh;
-                bool closedBackInside = close < zoneHigh;
-                return brokeAbove && closedBackInside && (upperWick / range) > WickRejectionRatio;
-            }
-            else
-            {
-                double lowerWick = Math.Min(open, close) - low;
-                bool brokeBelow = low < zoneLow;
-                bool closedBackInside = close > zoneLow;
-                return brokeBelow && closedBackInside && (lowerWick / range) > WickRejectionRatio;
             }
         }
     }
