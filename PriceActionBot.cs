@@ -25,11 +25,11 @@ namespace cAlgo.Robots
         [Parameter("Number Of Entries", DefaultValue = 3)]
         public int NumEntries { get; set; }
 
-        [Parameter("Group Take Profit ($)", DefaultValue = 2.0)]
-        public double GroupTakeProfit { get; set; }
+        [Parameter("Take Profit Per Trade ($)", DefaultValue = 2.0)]
+        public double TakeProfitPerTrade { get; set; }
 
-        [Parameter("Group Stop Loss ($)", DefaultValue = 5.0)]
-        public double GroupStopLoss { get; set; }
+        [Parameter("Stop Loss Per Trade ($)", DefaultValue = 5.0)]
+        public double StopLossPerTrade { get; set; }
 
         private MovingAverage fastMa;
         private MovingAverage slowMa;
@@ -44,21 +44,21 @@ namespace cAlgo.Robots
                 return;
             }
 
-            fastMa = Indicators.MovingAverage(MarketSeries.Close, FastPeriod, MovingAverageType.Simple);
-            slowMa = Indicators.MovingAverage(MarketSeries.Close, SlowPeriod, MovingAverageType.Simple);
+            fastMa = Indicators.MovingAverage(Bars.ClosePrices, FastPeriod, MovingAverageType.Simple);
+            slowMa = Indicators.MovingAverage(Bars.ClosePrices, SlowPeriod, MovingAverageType.Simple);
         }
 
         protected override void OnTick()
         {
-            CheckGroupExit();
+            CheckIndividualExits();
         }
 
         protected override void OnBar()
         {
-            if (HasOpenGroup()) return;
-            if (MarketSeries.Close.Count < SlowPeriod + 2) return;
+            if (HasOpenPositions()) return;
+            if (Bars.ClosePrices.Count < SlowPeriod + 2) return;
 
-            int idx = MarketSeries.Close.Count - 1;
+            int idx = Bars.ClosePrices.Count - 1;
 
             double fastNow = fastMa.Result[idx];
             double slowNow = slowMa.Result[idx];
@@ -93,10 +93,10 @@ namespace cAlgo.Robots
                 ExecuteMarketOrder(tradeType, SymbolName, volumeInUnits, Label);
             }
 
-            Print("Opened {0} entries, direction={1}", NumEntries, direction);
+            Print("Opened {0} independent entries, direction={1}", NumEntries, direction);
         }
 
-        private bool HasOpenGroup()
+        private bool HasOpenPositions()
         {
             foreach (var position in Positions)
             {
@@ -105,35 +105,26 @@ namespace cAlgo.Robots
             return false;
         }
 
-        private void CheckGroupExit()
+        private void CheckIndividualExits()
         {
-            double totalProfit = 0;
-            bool hasPositions = false;
+            // Snapshot first since ClosePosition modifies the collection while iterating
+            var toClose = new System.Collections.Generic.List<Position>();
 
             foreach (var position in Positions)
             {
                 if (position.Label != Label) continue;
-                hasPositions = true;
-                totalProfit += position.NetProfit;
-            }
 
-            if (!hasPositions) return;
-
-            if (totalProfit >= GroupTakeProfit || totalProfit <= -GroupStopLoss)
-            {
-                CloseAllGroupPositions();
-                Print("Group closed. Total P/L: {0:F2}", totalProfit);
-            }
-        }
-
-        private void CloseAllGroupPositions()
-        {
-            foreach (var position in Positions)
-            {
-                if (position.Label == Label)
+                if (position.NetProfit >= TakeProfitPerTrade || position.NetProfit <= -StopLossPerTrade)
                 {
-                    ClosePosition(position);
+                    toClose.Add(position);
                 }
+            }
+
+            foreach (var position in toClose)
+            {
+                double pnl = position.NetProfit;
+                ClosePosition(position);
+                Print("Closed position {0}. P/L: {1:F2}", position.Id, pnl);
             }
         }
 
@@ -145,8 +136,8 @@ namespace cAlgo.Robots
 
             for (int i = start; i <= idx; i++)
             {
-                if (MarketSeries.High[i] > zoneHigh) zoneHigh = MarketSeries.High[i];
-                if (MarketSeries.Low[i] < zoneLow) zoneLow = MarketSeries.Low[i];
+                if (Bars.HighPrices[i] > zoneHigh) zoneHigh = Bars.HighPrices[i];
+                if (Bars.LowPrices[i] < zoneLow) zoneLow = Bars.LowPrices[i];
             }
         }
 
@@ -154,10 +145,10 @@ namespace cAlgo.Robots
         {
             if (idx < 0) return false;
 
-            double open = MarketSeries.Open[idx];
-            double close = MarketSeries.Close[idx];
-            double high = MarketSeries.High[idx];
-            double low = MarketSeries.Low[idx];
+            double open = Bars.OpenPrices[idx];
+            double close = Bars.ClosePrices[idx];
+            double high = Bars.HighPrices[idx];
+            double low = Bars.LowPrices[idx];
             double range = high - low;
 
             if (range <= 0) return false;
