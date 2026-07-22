@@ -16,6 +16,18 @@ namespace cAlgo.Robots
         [Parameter("Min Body Ratio", DefaultValue = 0.6)]
         public double MinBodyRatio { get; set; }
 
+        [Parameter("Confirmation Distance (price)", DefaultValue = 0.15)]
+        public double ConfirmationDistance { get; set; }
+
+        [Parameter("Max Wait Bars For Confirmation", DefaultValue = 2)]
+        public int MaxWaitBars { get; set; }
+
+        [Parameter("Zone Lookback (bars)", DefaultValue = 40)]
+        public int ZoneLookback { get; set; }
+
+        [Parameter("Min Room To Zone (price)", DefaultValue = 0.8)]
+        public double MinRoomToZone { get; set; }
+
         [Parameter("Lots Per Entry", DefaultValue = 0.02)]
         public double LotsPerEntry { get; set; }
 
@@ -30,6 +42,11 @@ namespace cAlgo.Robots
 
         private const string Label = "XauSpikeScalpBot";
 
+        private bool waitingForConfirmation = false;
+        private string pendingDirection = null;
+        private double spikeClose = 0;
+        private int barsWaited = 0;
+
         protected override void OnStart()
         {
             if (SymbolName != "XAUUSD")
@@ -42,11 +59,13 @@ namespace cAlgo.Robots
 
         protected override void OnTick()
         {
-            // Manage exits every tick so $1 TP / $8 SL trigger instantly, per position
             CheckIndividualExits();
 
-            // As soon as we're flat, immediately look for the next spike (don't wait for next bar close)
-            if (!HasOpenPositions())
+            if (waitingForConfirmation)
+            {
+                CheckConfirmation();
+            }
+            else if (!HasOpenPositions())
             {
                 CheckForSpikeEntry();
             }
@@ -54,8 +73,16 @@ namespace cAlgo.Robots
 
         protected override void OnBar()
         {
-            // Also check on each new bar close in case OnTick missed a fresh signal
-            if (!HasOpenPositions())
+            if (waitingForConfirmation)
+            {
+                barsWaited++;
+                if (barsWaited > MaxWaitBars)
+                {
+                    Print("Confirmation timed out — cancelling spike signal.");
+                    ResetPendingSignal();
+                }
+            }
+            else if (!HasOpenPositions())
             {
                 CheckForSpikeEntry();
             }
@@ -63,9 +90,9 @@ namespace cAlgo.Robots
 
         private void CheckForSpikeEntry()
         {
-            if (Bars.ClosePrices.Count < SpikeLookback + 2) return;
+            if (Bars.ClosePrices.Count < Math.Max(SpikeLookback, ZoneLookback) + 2) return;
 
-            int idx = Bars.ClosePrices.Count - 2; // last FULLY closed bar
+            int idx = Bars.ClosePrices.Count - 2;
             if (idx < SpikeLookback) return;
 
             double avgRange = 0;
@@ -88,14 +115,95 @@ namespace cAlgo.Robots
 
             double body = Math.Abs(close - open);
             double bodyRatio = body / range;
-            if (bodyRatio < MinBodyRatio) return; // too wicky, not a clean directional spike
+            if (bodyRatio < MinBodyRatio) return;
 
             string direction = close > open ? "up" : "down";
 
-            Print("Spike detected: range={0:F2} avgRange={1:F2} bodyRatio={2:F2} dir={3}",
+            // Supply/demand filter: make sure there's room to run before hitting the opposite zone
+            double zoneHigh, zoneLow;
+            GetZone(idx, out zoneHigh, out zoneLow);
+
+            if (direction == "up")
+            {
+                double roomToSupply = zoneHigh - close;
+                if (roomToSupply < MinRoomToZone)
+                {
+                    Print("Spike up but too close to supply zone ({0:F2} room) — skipping.", roomToSupply);
+                    return;
+                }
+            }
+            else
+            {
+                double roomToDemand = close - zoneLow;
+                if (roomToDemand < MinRoomToZone)
+                {
+                    Print("Spike down but too close to demand zone ({0:F2} room) — skipping.", roomToDemand);
+                    return;
+                }
+            }
+
+            Print("Spike candidate: range={0:F2} avgRange={1:F2} bodyRatio={2:F2} dir={3} — waiting for confirmation",
                 range, avgRange, bodyRatio, direction);
 
-            OpenTradeBatch(direction);
+            waitingForConfirmation = true;
+            pendingDirection = direction;
+            spikeClose = close;
+            barsWaited = 0;
+        }
+
+        private void GetZone(int idx, out double zoneHigh, out double zoneLow)
+        {
+            int start = Math.Max(0, idx - ZoneLookback);
+            zoneHigh = double.MinValue;
+            zoneLow = double.MaxValue;
+
+            for (int i = start; i <= idx; i++)
+            {
+                if (Bars.HighPrices[i] > zoneHigh) zoneHigh = Bars.HighPrices[i];
+                if (Bars.LowPrices[i] < zoneLow) zoneLow = Bars.LowPrices[i];
+            }
+        }
+
+        private void CheckConfirmation()
+        {
+            double currentPrice = pendingDirection == "up" ? Symbol.Bid : Symbol.Ask;
+
+            if (pendingDirection == "up")
+            {
+                if (currentPrice >= spikeClose + ConfirmationDistance)
+                {
+                    Print("Confirmed continuation upward — entering now.");
+                    OpenTradeBatch("up");
+                    ResetPendingSignal();
+                }
+                else if (currentPrice <= spikeClose - ConfirmationDistance)
+                {
+                    Print("Price reversed instead of continuing — cancelling signal.");
+                    ResetPendingSignal();
+                }
+            }
+            else
+            {
+                if (currentPrice <= spikeClose - ConfirmationDistance)
+                {
+                    Print("Confirmed continuation downward — entering now.");
+                    OpenTradeBatch("down");
+                    ResetPendingSignal();
+                }
+                else if (currentPrice >= spikeClose + ConfirmationDistance)
+                {
+                    Print("Price reversed instead of continuing — cancelling signal.");
+                    ResetPendingSignal();
+                }
+            }
+        }
+
+        private void ResetPendingSignal()
+        {
+            waitingForConfirmation = false;
+            pendingDirection = null;
+            spikeClose = 0;
+            barsWaited = 0;
         }
 
         private void OpenTradeBatch(string direction)
@@ -108,7 +216,7 @@ namespace cAlgo.Robots
                 ExecuteMarketOrder(tradeType, SymbolName, volumeInUnits, Label);
             }
 
-            Print("Opened {0} spike-follow entries, direction={1}", NumEntries, direction);
+            Print("Opened {0} confirmed spike-follow entries, direction={1}", NumEntries, direction);
         }
 
         private bool HasOpenPositions()
