@@ -5,58 +5,45 @@ using cAlgo.API;
 namespace cAlgo.Robots
 {
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class XauSpikeScalpBot : Robot
+    public class XauMomentumScalpBot : Robot
     {
-        // ---- Spike detection ----
-        [Parameter("Spike Lookback (bars)", DefaultValue = 20)]
-        public int SpikeLookback { get; set; }
+        // ---- Momentum candle detection ----
+        [Parameter("Momentum Lookback (bars)", DefaultValue = 20)]
+        public int MomentumLookback { get; set; }
 
-        [Parameter("Spike Multiplier", DefaultValue = 1.8)]
-        public double SpikeMultiplier { get; set; }
+        [Parameter("Momentum Multiplier", DefaultValue = 1.4)]
+        public double MomentumMultiplier { get; set; }
 
-        [Parameter("Min Body Ratio", DefaultValue = 0.6)]
+        [Parameter("Min Body Ratio", DefaultValue = 0.55)]
         public double MinBodyRatio { get; set; }
 
-        // ---- Confirmation ----
-        [Parameter("Confirmation Distance (price)", DefaultValue = 0.15)]
-        public double ConfirmationDistance { get; set; }
+        [Parameter("Require Candlestick Pattern", DefaultValue = false)]
+        public bool RequirePattern { get; set; }
 
-        [Parameter("Max Wait Bars For Confirmation", DefaultValue = 2)]
-        public int MaxWaitBars { get; set; }
-
-        // ---- Supply/Demand (simple zone, used by spike path) ----
-        [Parameter("Zone Lookback (bars)", DefaultValue = 40)]
-        public int ZoneLookback { get; set; }
-
-        [Parameter("Min Room To Zone (price)", DefaultValue = 0.4)]
-        public double MinRoomToZone { get; set; }
-
-        // ---- Pivot Support/Resistance (used by breakout path) ----
+        // ---- Pivot Support/Resistance ----
         [Parameter("Pivot Strength (bars each side)", DefaultValue = 3)]
         public int PivotStrength { get; set; }
 
         [Parameter("Pivot Search Window (bars)", DefaultValue = 60)]
         public int PivotSearchWindow { get; set; }
 
-        // ---- Trade management ----
-        [Parameter("Lots Per Entry", DefaultValue = 0.02)]
+        [Parameter("Min Room To Level (price)", DefaultValue = 0.3)]
+        public double MinRoomToLevel { get; set; }
+
+        // ---- Trade management (tuned for small account) ----
+        [Parameter("Lots Per Entry", DefaultValue = 0.01)]
         public double LotsPerEntry { get; set; }
 
-        [Parameter("Number Of Entries", DefaultValue = 10)]
+        [Parameter("Number Of Entries", DefaultValue = 2)]
         public int NumEntries { get; set; }
 
         [Parameter("Take Profit Per Trade ($)", DefaultValue = 1.0)]
         public double TakeProfitPerTrade { get; set; }
 
-        [Parameter("Stop Loss Per Trade ($)", DefaultValue = 8.0)]
+        [Parameter("Stop Loss Per Trade ($)", DefaultValue = 2.0)]
         public double StopLossPerTrade { get; set; }
 
-        private const string Label = "XauSpikeScalpBot";
-
-        private bool waitingForConfirmation = false;
-        private string? pendingDirection = null;
-        private double refPrice = 0;
-        private int barsWaited = 0;
+        private const string Label = "XauMomentumScalpBot";
 
         protected override void OnStart()
         {
@@ -66,60 +53,32 @@ namespace cAlgo.Robots
                 Stop();
                 return;
             }
+
+            Print("Bot started. Account balance: {0:F2} — verify lot size/entry count fits your balance before scaling up.", Account.Balance);
         }
 
         protected override void OnTick()
         {
             CheckIndividualExits();
-
-            if (waitingForConfirmation)
-            {
-                CheckConfirmation();
-            }
-            else if (!HasOpenPositions())
-            {
-                CheckForSpikeEntry();
-                if (!waitingForConfirmation)
-                {
-                    CheckForPivotBreakoutEntry();
-                }
-            }
         }
 
         protected override void OnBar()
         {
-            if (waitingForConfirmation)
-            {
-                barsWaited++;
-                if (barsWaited > MaxWaitBars)
-                {
-                    Print("Confirmation timed out — cancelling signal.");
-                    ResetPendingSignal();
-                }
-            }
-            else if (!HasOpenPositions())
-            {
-                CheckForSpikeEntry();
-                if (!waitingForConfirmation)
-                {
-                    CheckForPivotBreakoutEntry();
-                }
-            }
+            // No waiting, no confirmation delay — evaluate and act the instant a bar closes
+            if (HasOpenPositions()) return;
+            TryEnterOnMomentum();
         }
 
-        // ================= PATH A: SPIKE + ZONE =================
-
-        private void CheckForSpikeEntry()
+        private void TryEnterOnMomentum()
         {
-            if (Bars.ClosePrices.Count < Math.Max(SpikeLookback, ZoneLookback) + 2) return;
+            if (Bars.ClosePrices.Count < Math.Max(MomentumLookback, PivotSearchWindow) + PivotStrength + 2) return;
 
-            int idx = Bars.ClosePrices.Count - 2;
-            if (idx < SpikeLookback) return;
+            int idx = Bars.ClosePrices.Count - 2; // last fully closed bar
 
             double avgRange = 0;
-            for (int i = idx - SpikeLookback; i < idx; i++)
+            for (int i = idx - MomentumLookback; i < idx; i++)
                 avgRange += (Bars.HighPrices[i] - Bars.LowPrices[i]);
-            avgRange /= SpikeLookback;
+            avgRange /= MomentumLookback;
 
             double open = Bars.OpenPrices[idx];
             double close = Bars.ClosePrices[idx];
@@ -128,89 +87,53 @@ namespace cAlgo.Robots
             double range = high - low;
 
             if (range <= 0 || avgRange <= 0) return;
-            if (range < avgRange * SpikeMultiplier) return;
 
+            bool isBigCandle = range >= avgRange * MomentumMultiplier;
             double body = Math.Abs(close - open);
-            if (body / range < MinBodyRatio) return;
+            bool strongBody = (body / range) >= MinBodyRatio;
+
+            if (!isBigCandle || !strongBody) return;
 
             string direction = close > open ? "up" : "down";
 
-            double zoneHigh, zoneLow;
-            GetSimpleZone(idx, out zoneHigh, out zoneLow);
-
-            if (direction == "up" && (zoneHigh - close) < MinRoomToZone)
-            {
-                Print("Spike up but too close to supply zone ({0:F2} room) — skipping.", zoneHigh - close);
-                return;
-            }
-            if (direction == "down" && (close - zoneLow) < MinRoomToZone)
-            {
-                Print("Spike down but too close to demand zone ({0:F2} room) — skipping.", close - zoneLow);
-                return;
-            }
-
-            Print("SPIKE signal: dir={0} — waiting for confirmation.", direction);
-            ArmSignal(direction, close);
-        }
-
-        private void GetSimpleZone(int idx, out double zoneHigh, out double zoneLow)
-        {
-            int start = Math.Max(0, idx - ZoneLookback);
-            zoneHigh = double.MinValue;
-            zoneLow = double.MaxValue;
-            for (int i = start; i <= idx; i++)
-            {
-                if (Bars.HighPrices[i] > zoneHigh) zoneHigh = Bars.HighPrices[i];
-                if (Bars.LowPrices[i] < zoneLow) zoneLow = Bars.LowPrices[i];
-            }
-        }
-
-        // ================= PATH B: PIVOT BREAKOUT + CANDLE PATTERN =================
-
-        private void CheckForPivotBreakoutEntry()
-        {
-            if (Bars.ClosePrices.Count < PivotSearchWindow + PivotStrength + 2) return;
-
-            int idx = Bars.ClosePrices.Count - 2; // last closed bar
+            // Support/Resistance filter — skip only if we're jammed right against the opposing level
             double resistance, support;
-            if (!FindNearestPivots(idx, out resistance, out support)) return;
-
-            double open = Bars.OpenPrices[idx];
-            double close = Bars.ClosePrices[idx];
-            double high = Bars.HighPrices[idx];
-            double low = Bars.LowPrices[idx];
-            double range = high - low;
-            if (range <= 0) return;
-
-            bool brokeResistance = close > resistance && Bars.ClosePrices[idx - 1] <= resistance;
-            bool brokeSupport = close < support && Bars.ClosePrices[idx - 1] >= support;
-
-            if (!brokeResistance && !brokeSupport) return;
-
-            string direction = brokeResistance ? "up" : "down";
-
-            bool patternConfirms =
-                (direction == "up" && (IsBullishEngulfing(idx) || IsHammer(idx))) ||
-                (direction == "down" && (IsBearishEngulfing(idx) || IsShootingStar(idx)));
-
-            if (!patternConfirms)
+            if (FindNearestPivots(idx, out resistance, out support))
             {
-                Print("Pivot breakout ({0}) but no confirming candle pattern — skipping.", direction);
-                return;
+                if (direction == "up" && resistance != double.MaxValue && (resistance - close) < MinRoomToLevel)
+                {
+                    Print("Momentum up but pinned under resistance ({0:F2} room) — skipping.", resistance - close);
+                    return;
+                }
+                if (direction == "down" && support != double.MinValue && (close - support) < MinRoomToLevel)
+                {
+                    Print("Momentum down but pinned above support ({0:F2} room) — skipping.", close - support);
+                    return;
+                }
             }
 
-            Print("BREAKOUT signal: dir={0} level={1:F2} — waiting for confirmation.",
-                direction, direction == "up" ? resistance : support);
-            ArmSignal(direction, close);
+            if (RequirePattern)
+            {
+                bool patternConfirms =
+                    (direction == "up" && (IsBullishEngulfing(idx) || IsHammer(idx))) ||
+                    (direction == "down" && (IsBearishEngulfing(idx) || IsShootingStar(idx)));
+
+                if (!patternConfirms)
+                {
+                    Print("Big candle ({0}) but no confirming candlestick pattern — skipping.", direction);
+                    return;
+                }
+            }
+
+            Print("MOMENTUM entry: dir={0} range={1:F2} avgRange={2:F2} — entering immediately.", direction, range, avgRange);
+            OpenTradeBatch(direction);
         }
 
-        /// Finds nearest pivot high above and pivot low below the current price,
-        /// where a pivot is a bar whose high/low is the extreme among PivotStrength bars on each side.
         private bool FindNearestPivots(int idx, out double resistance, out double support)
         {
             resistance = double.MaxValue;
             support = double.MinValue;
-            bool foundRes = false, foundSup = false;
+            bool found = false;
 
             double currentPrice = Bars.ClosePrices[idx];
             int start = Math.Max(PivotStrength, idx - PivotSearchWindow);
@@ -231,19 +154,17 @@ namespace cAlgo.Robots
                 if (isPivotHigh && Bars.HighPrices[i] > currentPrice && Bars.HighPrices[i] < resistance)
                 {
                     resistance = Bars.HighPrices[i];
-                    foundRes = true;
+                    found = true;
                 }
                 if (isPivotLow && Bars.LowPrices[i] < currentPrice && Bars.LowPrices[i] > support)
                 {
                     support = Bars.LowPrices[i];
-                    foundSup = true;
+                    found = true;
                 }
             }
 
-            return foundRes || foundSup;
+            return found;
         }
-
-        // ================= CANDLESTICK PATTERNS =================
 
         private bool IsBullishEngulfing(int idx)
         {
@@ -252,11 +173,9 @@ namespace cAlgo.Robots
             double prevClose = Bars.ClosePrices[idx - 1];
             double open = Bars.OpenPrices[idx];
             double close = Bars.ClosePrices[idx];
-
             bool prevBear = prevClose < prevOpen;
             bool currBull = close > open;
             bool engulfs = open <= prevClose && close >= prevOpen;
-
             return prevBear && currBull && engulfs;
         }
 
@@ -267,11 +186,9 @@ namespace cAlgo.Robots
             double prevClose = Bars.ClosePrices[idx - 1];
             double open = Bars.OpenPrices[idx];
             double close = Bars.ClosePrices[idx];
-
             bool prevBull = prevClose > prevOpen;
             bool currBear = close < open;
             bool engulfs = open >= prevClose && close <= prevOpen;
-
             return prevBull && currBear && engulfs;
         }
 
@@ -283,12 +200,9 @@ namespace cAlgo.Robots
             double low = Bars.LowPrices[idx];
             double range = high - low;
             if (range <= 0) return false;
-
             double body = Math.Abs(close - open);
             double lowerWick = Math.Min(open, close) - low;
             double upperWick = high - Math.Max(open, close);
-
-            // Small body near the top, long lower wick, minimal upper wick
             return lowerWick > body * 2 && upperWick < body && body / range < 0.35;
         }
 
@@ -300,66 +214,10 @@ namespace cAlgo.Robots
             double low = Bars.LowPrices[idx];
             double range = high - low;
             if (range <= 0) return false;
-
             double body = Math.Abs(close - open);
             double upperWick = high - Math.Max(open, close);
             double lowerWick = Math.Min(open, close) - low;
-
-            // Small body near the bottom, long upper wick, minimal lower wick
             return upperWick > body * 2 && lowerWick < body && body / range < 0.35;
-        }
-
-        // ================= SHARED CONFIRMATION / EXECUTION =================
-
-        private void ArmSignal(string direction, double referencePrice)
-        {
-            waitingForConfirmation = true;
-            pendingDirection = direction;
-            refPrice = referencePrice;
-            barsWaited = 0;
-        }
-
-        private void CheckConfirmation()
-        {
-            if (pendingDirection == null) return;
-            double currentPrice = pendingDirection == "up" ? Symbol.Bid : Symbol.Ask;
-
-            if (pendingDirection == "up")
-            {
-                if (currentPrice >= refPrice + ConfirmationDistance)
-                {
-                    Print("Confirmed continuation upward — entering now.");
-                    OpenTradeBatch("up");
-                    ResetPendingSignal();
-                }
-                else if (currentPrice <= refPrice - ConfirmationDistance)
-                {
-                    Print("Price reversed instead of continuing — cancelling signal.");
-                    ResetPendingSignal();
-                }
-            }
-            else
-            {
-                if (currentPrice <= refPrice - ConfirmationDistance)
-                {
-                    Print("Confirmed continuation downward — entering now.");
-                    OpenTradeBatch("down");
-                    ResetPendingSignal();
-                }
-                else if (currentPrice >= refPrice + ConfirmationDistance)
-                {
-                    Print("Price reversed instead of continuing — cancelling signal.");
-                    ResetPendingSignal();
-                }
-            }
-        }
-
-        private void ResetPendingSignal()
-        {
-            waitingForConfirmation = false;
-            pendingDirection = null;
-            refPrice = 0;
-            barsWaited = 0;
         }
 
         private void OpenTradeBatch(string direction)
