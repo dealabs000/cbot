@@ -1,162 +1,181 @@
 using System;
-using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Indicators;
-using cAlgo.API.Requests;
-using System.Collections.Generic;
 
 namespace cAlgo.Robots
 {
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class XAUUSD_Scalper : Robot
+    public class XauScalpBot : Robot
     {
-        // Parameters
-        [Parameter("Trade Size (Units)", Group = "Risk", DefaultValue = 1000)]
-        public double TradeSize { get; set; }
+        [Parameter("Fast MA Period", DefaultValue = 3)]
+        public int FastPeriod { get; set; }
 
-        [Parameter("Take Profit ($)", Group = "Risk", DefaultValue = 1.0)]
-        public double TakeProfitDollars { get; set; }
+        [Parameter("Slow MA Period", DefaultValue = 8)]
+        public int SlowPeriod { get; set; }
 
-        [Parameter("EMA Fast Period", Group = "Indicators", DefaultValue = 5)]
-        public int EmaFastPeriod { get; set; }
+        [Parameter("Zone Lookback", DefaultValue = 15)]
+        public int ZoneLookback { get; set; }
 
-        [Parameter("EMA Slow Period", Group = "Indicators", DefaultValue = 20)]
-        public int EmaSlowPeriod { get; set; }
+        [Parameter("Wick Rejection Ratio", DefaultValue = 0.5)]
+        public double WickRejectionRatio { get; set; }
 
-        [Parameter("RSI Period", Group = "Indicators", DefaultValue = 7)]
-        public int RsiPeriod { get; set; }
+        [Parameter("Lots Per Entry", DefaultValue = 0.02)]
+        public double LotsPerEntry { get; set; }
 
-        [Parameter("RSI Overbought", Group = "Indicators", DefaultValue = 70)]
-        public int RsiOverbought { get; set; }
+        [Parameter("Number Of Entries", DefaultValue = 3)]
+        public int NumEntries { get; set; }
 
-        [Parameter("RSI Oversold", Group = "Indicators", DefaultValue = 30)]
-        public int RsiOversold { get; set; }
+        [Parameter("Group Take Profit ($)", DefaultValue = 2.0)]
+        public double GroupTakeProfit { get; set; }
 
-        [Parameter("Max Trades Per Bar", Group = "Settings", DefaultValue = 2)]
-        public int MaxTradesPerBar { get; set; }
+        [Parameter("Group Stop Loss ($)", DefaultValue = 5.0)]
+        public double GroupStopLoss { get; set; }
 
-        // Indicators
-        private ExponentialMovingAverage emaFast;
-        private ExponentialMovingAverage emaSlow;
-        private RelativeStrengthIndex rsi;
-
-        // Tracking
-        private int tradesThisBar = 0;
-        private DateTime currentBarTime;
-        private Dictionary<long, double> entryPrices = new Dictionary<long, double>();
+        private MovingAverage fastMa;
+        private MovingAverage slowMa;
+        private const string Label = "XauScalpBot";
 
         protected override void OnStart()
         {
-            // Initialize indicators
-            emaFast = Indicators.ExponentialMovingAverage(Bars.ClosePrices, EmaFastPeriod);
-            emaSlow = Indicators.ExponentialMovingAverage(Bars.ClosePrices, EmaSlowPeriod);
-            rsi = Indicators.RelativeStrengthIndex(Bars.ClosePrices, RsiPeriod);
+            if (SymbolName != "XAUUSD")
+            {
+                Print("This bot only trades XAUUSD. Attach it to an XAUUSD M1 chart.");
+                Stop();
+                return;
+            }
 
-            currentBarTime = Bars.Last(0).OpenTime;
-            Print("XAUUSD Scalper Started - Target: $1 profit per trade");
+            fastMa = Indicators.MovingAverage(MarketSeries.Close, FastPeriod, MovingAverageType.Simple);
+            slowMa = Indicators.MovingAverage(MarketSeries.Close, SlowPeriod, MovingAverageType.Simple);
         }
 
         protected override void OnTick()
         {
-            // Check for new bar
-            if (Bars.Last(0).OpenTime != currentBarTime)
-            {
-                currentBarTime = Bars.Last(0).OpenTime;
-                tradesThisBar = 0;
-                
-                // Clean closed positions
-                CleanEntryPrices();
-            }
-
-            // Manage existing positions
-            ManagePositions();
-
-            // Open new trades
-            if (tradesThisBar < MaxTradesPerBar)
-            {
-                OpenTrades();
-            }
+            CheckGroupExit();
         }
 
-        private void ManagePositions()
+        protected override void OnBar()
+        {
+            if (HasOpenGroup()) return;
+            if (MarketSeries.Close.Count < SlowPeriod + 2) return;
+
+            int idx = MarketSeries.Close.Count - 1;
+
+            double fastNow = fastMa.Result[idx];
+            double slowNow = slowMa.Result[idx];
+            double fastPrev = fastMa.Result[idx - 1];
+            double slowPrev = slowMa.Result[idx - 1];
+
+            string direction = null;
+            if (fastPrev <= slowPrev && fastNow > slowNow) direction = "up";
+            else if (fastPrev >= slowPrev && fastNow < slowNow) direction = "down";
+
+            if (direction == null) return;
+
+            double zoneHigh, zoneLow;
+            GetZone(idx, out zoneHigh, out zoneLow);
+
+            if (IsFakeout(idx - 1, zoneHigh, zoneLow, direction))
+            {
+                Print("Fakeout detected on M1 — skipping entry.");
+                return;
+            }
+
+            OpenTradeGroup(direction);
+        }
+
+        private void OpenTradeGroup(string direction)
+        {
+            var tradeType = direction == "up" ? TradeType.Buy : TradeType.Sell;
+            var volumeInUnits = Symbol.QuantityToVolumeInUnits(LotsPerEntry);
+
+            for (int i = 0; i < NumEntries; i++)
+            {
+                ExecuteMarketOrder(tradeType, SymbolName, volumeInUnits, Label);
+            }
+
+            Print("Opened {0} entries, direction={1}", NumEntries, direction);
+        }
+
+        private bool HasOpenGroup()
         {
             foreach (var position in Positions)
             {
-                if (position.SymbolName != SymbolName) continue;
+                if (position.Label == Label) return true;
+            }
+            return false;
+        }
 
-                double profitInDollars = position.NetProfit;
-                
-                // Close if profit >= $1
-                if (profitInDollars >= TakeProfitDollars)
+        private void CheckGroupExit()
+        {
+            double totalProfit = 0;
+            bool hasPositions = false;
+
+            foreach (var position in Positions)
+            {
+                if (position.Label != Label) continue;
+                hasPositions = true;
+                totalProfit += position.NetProfit;
+            }
+
+            if (!hasPositions) return;
+
+            if (totalProfit >= GroupTakeProfit || totalProfit <= -GroupStopLoss)
+            {
+                CloseAllGroupPositions();
+                Print("Group closed. Total P/L: {0:F2}", totalProfit);
+            }
+        }
+
+        private void CloseAllGroupPositions()
+        {
+            foreach (var position in Positions)
+            {
+                if (position.Label == Label)
                 {
                     ClosePosition(position);
-                    Print($"Closed {position.TradeType} at ${profitInDollars:F2} profit");
-                }
-                
-                // Emergency stop loss - prevent big losses
-                if (profitInDollars <= -2.0)
-                {
-                    ClosePosition(position);
-                    Print($"Emergency close: ${profitInDollars:F2} loss");
                 }
             }
         }
 
-        private void OpenTrades()
+        private void GetZone(int idx, out double zoneHigh, out double zoneLow)
         {
-            var lastBar = Bars.Last(1);
-            var currentClose = lastBar.Close;
-            var currentHigh = lastBar.High;
-            var currentLow = lastBar.Low;
+            int start = Math.Max(0, idx - ZoneLookback);
+            zoneHigh = double.MinValue;
+            zoneLow = double.MaxValue;
 
-            // Check trend with EMAs
-            bool uptrend = emaFast.Result.Last(1) > emaSlow.Result.Last(1) && 
-                          emaFast.Result.Last(2) <= emaSlow.Result.Last(2);
-            
-            bool downtrend = emaFast.Result.Last(1) < emaSlow.Result.Last(1) && 
-                            emaFast.Result.Last(2) >= emaSlow.Result.Last(2);
-
-            double rsiValue = rsi.Result.Last(1);
-            double prevRsi = rsi.Result.Last(2);
-
-            // Calculate TP in pips for $1
-            double tickValue = Symbol.PipValue * (TradeSize / 100000);
-            double targetPips = Math.Max(TakeProfitDollars / tickValue, 10);
-            
-            // Buy signal: EMA crossover up + RSI not overbought + price near low
-            if (uptrend && rsiValue < RsiOverbought && currentClose <= currentLow + 0.5 * (currentHigh - currentLow))
+            for (int i = start; i <= idx; i++)
             {
-                ExecuteMarketOrder(TradeType.Buy, SymbolName, TradeSize, "ScalpBuy", 
-                    null, targetPips * Symbol.PipSize);
-                tradesThisBar++;
-                Print($"BUY Signal - RSI: {rsiValue:F1}, Price: {currentClose}");
-            }
-            
-            // Sell signal: EMA crossover down + RSI not oversold + price near high
-            else if (downtrend && rsiValue > RsiOversold && currentClose >= currentHigh - 0.5 * (currentHigh - currentLow))
-            {
-                ExecuteMarketOrder(TradeType.Sell, SymbolName, TradeSize, "ScalpSell", 
-                    null, targetPips * Symbol.PipSize);
-                tradesThisBar++;
-                Print($"SELL Signal - RSI: {rsiValue:F1}, Price: {currentClose}");
+                if (MarketSeries.High[i] > zoneHigh) zoneHigh = MarketSeries.High[i];
+                if (MarketSeries.Low[i] < zoneLow) zoneLow = MarketSeries.Low[i];
             }
         }
 
-        private void CleanEntryPrices()
+        private bool IsFakeout(int idx, double zoneHigh, double zoneLow, string direction)
         {
-            var toRemove = new List<long>();
-            foreach (var pos in Positions)
-            {
-                if (!entryPrices.ContainsKey(pos.Id))
-                    toRemove.Add(pos.Id);
-            }
-            foreach (var id in toRemove)
-                entryPrices.Remove(id);
-        }
+            if (idx < 0) return false;
 
-        protected override void OnStop()
-        {
-            Print("XAUUSD Scalper Stopped");
+            double open = MarketSeries.Open[idx];
+            double close = MarketSeries.Close[idx];
+            double high = MarketSeries.High[idx];
+            double low = MarketSeries.Low[idx];
+            double range = high - low;
+
+            if (range <= 0) return false;
+
+            if (direction == "up")
+            {
+                double upperWick = high - Math.Max(open, close);
+                bool brokeAbove = high > zoneHigh;
+                bool closedBackInside = close < zoneHigh;
+                return brokeAbove && closedBackInside && (upperWick / range) > WickRejectionRatio;
+            }
+            else
+            {
+                double lowerWick = Math.Min(open, close) - low;
+                bool brokeBelow = low < zoneLow;
+                bool closedBackInside = close > zoneLow;
+                return brokeBelow && closedBackInside && (lowerWick / range) > WickRejectionRatio;
+            }
         }
     }
 }
